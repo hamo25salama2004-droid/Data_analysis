@@ -1,13 +1,12 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from sklearn.impute import KNNImputer, SimpleImputer, IterativeImputer
-from sklearn.ensemble import IsolationForest
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.impute import KNNImputer, IterativeImputer # للتعويض الذكي (MICE)
+from sklearn.ensemble import IsolationForest # لكشف الشواذ (AI)
 from textblob import TextBlob
 from langdetect import detect, LangDetectException
-from deep_translator import GoogleTranslator
-from fuzzywuzzy import fuzz
+from deep_translator import GoogleTranslator # للترجمة
+from fuzzywuzzy import fuzz # للمطابقة الضبابية
 import re
 import io
 
@@ -27,7 +26,6 @@ class SmartCleaner:
             elif pd.api.types.is_numeric_dtype(self.df[col]):
                 col_types["numeric"].append(col)
             else:
-                # إذا كانت نصية وبها قيم فريدة قليلة، تعتبر فئوية
                 if self.df[col].nunique() < 50 and self.df.shape[0] > 100:
                     col_types["categorical"].append(col)
                 col_types["text"].append(col)
@@ -68,26 +66,25 @@ class SmartCleaner:
             return self.df, initial_rows - self.df.shape[0]
         
         elif method == "Fuzzy Match (Text)":
-            # 5 عمليات ضمن هذه التقنية
+            # تبسيط منطق Fuzzy Match للحفاظ على سرعة Streamlit
             def get_fuzz_score(row):
-                # ندمج القيم في الأعمدة المحددة للمقارنة
                 combined = tuple(row[c] for c in cols)
                 scores = []
-                for i in range(len(self.df)):
-                    target_combined = tuple(self.df.iloc[i][c] for c in cols)
-                    if row.name != self.df.iloc[i].name:
-                        # جودة المطابقة (Qratio) هي الأقوى من Fuzzywuzzy
+                # نقارن مع عينة فقط لتسريع العملية
+                sample_df = self.df.sample(min(100, len(self.df))) 
+                for i in range(len(sample_df)):
+                    target_combined = tuple(sample_df.iloc[i][c] for c in cols)
+                    if row.name != sample_df.iloc[i].name:
                         score = fuzz.QRatio(str(combined), str(target_combined))
                         scores.append(score)
                 return max(scores) if scores else 100
 
-            # نحذف الصفوف التي لديها تطابق قوي جداً
+            # نحدد ونحذف الصفوف التي لديها تطابق قوي جداً
             duplicate_indices = self.df.apply(lambda row: get_fuzz_score(row) >= threshold, axis=1)
-            
-            # نحتفظ بالنسخ الفريدة (تعتمد على طريقة عمل FuzzyWuzzy)
-            temp_df = self.df[duplicate_indices].drop_duplicates(subset=cols)
-            self.df = pd.concat([self.df[~duplicate_indices], temp_df])
-            return self.df, self.df.shape[0] - initial_rows 
+            initial_rows = self.df.shape[0]
+            self.df = self.df[~duplicate_indices].drop_duplicates(subset=cols, keep='first') # نحذف الصفوف المشابهة
+
+            return self.df, initial_rows - self.df.shape[0]
         
         return self.df, 0
 
@@ -104,32 +101,32 @@ class SmartCleaner:
                 self.df = self.df[(self.df[col] >= lower_bound) & (self.df[col] <= upper_bound)]
             
             elif method == "Z-Score Filter":
-                # نحذف الصفوف التي تبعد أكثر من threshold (افتراضياً 3)
                 self.df = self.df[np.abs(self.df[col]-self.df[col].mean())/self.df[col].std() < threshold]
 
             elif method == "Isolation Forest (AI)":
                 iso = IsolationForest(contamination=0.1, random_state=42)
-                yhat = iso.fit_predict(self.df[col].fillna(self.df[col].median()).values.reshape(-1, 1))
+                # يجب تعبئة القيم المفقودة قبل تطبيق Isolation Forest
+                temp_data = self.df[col].fillna(self.df[col].median()).values.reshape(-1, 1)
+                yhat = iso.fit_predict(temp_data)
                 mask = yhat != -1
                 self.df = self.df[mask]
 
             elif method == "Capping (Winsorization)":
-                # استبدال القيم المتطرفة بالحدود القصوى
                 Q1 = self.df[col].quantile(0.05)
                 Q3 = self.df[col].quantile(0.95)
                 self.df[col] = np.where(self.df[col] < Q1, Q1, self.df[col])
                 self.df[col] = np.where(self.df[col] > Q3, Q3, self.df[col])
             
             elif method == "Log Transformation":
-                # تقليل تأثير القيم الكبيرة جداً
-                self.df[col] = np.log1p(self.df[col]) # log(1+x)
+                self.df[col] = np.log1p(self.df[col]) 
 
         return self.df, initial_rows - self.df.shape[0]
 
     # --- 5. معالجة النصوص والترجمة (15 عملية + ترجمة) ---
     def handle_text_and_translate(self, cols, method, target_lang=None):
         for col in cols:
-            self.df[col] = self.df[col].astype(str)
+            # يجب التأكد أن العمود نصي قبل محاولة المعالجة
+            self.df[col] = self.df[col].astype(str).replace('nan', '')
             
             if method == "Lowercase":
                 self.df[col] = self.df[col].str.lower()
@@ -138,9 +135,16 @@ class SmartCleaner:
             elif method == "Remove Punctuation":
                 self.df[col] = self.df[col].str.replace(r'[^\w\s]', '', regex=True)
             elif method == "Remove Stop Words (English)":
-                from nltk.corpus import stopwords
-                stop_words = set(stopwords.words('english'))
-                self.df[col] = self.df[col].apply(lambda x: ' '.join([word for word in x.split() if word not in stop_words]))
+                # يتطلب تحميل مكتبة nltk
+                try:
+                    import nltk
+                    from nltk.corpus import stopwords
+                    nltk.download('stopwords', quiet=True)
+                    stop_words = set(stopwords.words('english'))
+                    self.df[col] = self.df[col].apply(lambda x: ' '.join([word for word in x.split() if word not in stop_words]))
+                except Exception as e:
+                    st.warning(f"لإزالة Stop Words، يرجى التأكد من تثبيت nltk: {e}")
+
             elif method == "Spelling Correction (English Only)":
                 # هذه العملية هي أحد أجزاء الـ 100 عملية
                 self.df[col] = self.df[col].apply(lambda x: str(TextBlob(x).correct()))
@@ -148,8 +152,9 @@ class SmartCleaner:
             # --- الترجمة (المطلوب في الكود) ---
             elif method in ["Translate to English", "Translate to Arabic"]:
                 if target_lang:
+                    # نستخدم GoogleTranslator من deep_translator
                     translator = GoogleTranslator(source='auto', target=target_lang)
-                    # يجب تقسيم الترجمة لصفوف لتفادي خطأ حجم النص
+                    # الترجمة تتم صفاً بصف
                     self.df[col] = self.df[col].apply(lambda x: translator.translate(x) if x and x != 'nan' else x)
         return self.df
 
@@ -168,7 +173,6 @@ class SmartCleaner:
             elif op == "Extract Hour":
                 self.df[f'{col}_Hour'] = self.df[col].dt.hour
             elif op == "Timezone Localization (UTC)":
-                # مثال توضيحي: يمكن إضافة خيارات لتحديد المنطقة الزمنية
                 self.df[col] = self.df[col].dt.tz_localize(None).dt.tz_localize('UTC')
         return self.df
 
@@ -179,7 +183,7 @@ class SmartCleaner:
 def main():
     st.set_page_config(page_title="AI Data Cleaner Pro V2", layout="wide", page_icon="🤖")
     
-    st.title("🤖 AI Data Cleaner Pro - محرك الـ 100 عملية")
+    st.title("🤖 AI Data Cleaner Pro - محرك الـ 100 عملية (الإصدار النهائي)")
     st.markdown("---")
 
     # --- Session State ---
@@ -198,36 +202,44 @@ def main():
     ]
     section = st.sidebar.radio("اختر القسم:", sections)
     
-    # --- 1. تحميل البيانات ---
+    # =========================================================
+    # 1. تحميل البيانات
+    # =========================================================
     if section == "1. تحميل البيانات":
         st.header("📂 1. تحميل البيانات")
         uploaded_file = st.file_uploader("ارفع ملف CSV أو Excel", type=["csv", "xlsx"])
         if uploaded_file:
-            if uploaded_file.name.endswith('.csv'):
-                df = pd.read_csv(uploaded_file)
-            else:
-                df = pd.read_excel(uploaded_file)
-            
-            st.session_state.df = df
-            cleaner = SmartCleaner(df)
-            st.session_state.col_types = cleaner.detect_column_types()
-            st.success(f"تم تحميل الملف بنجاح! ({df.shape[0]} صف و {df.shape[1]} عمود)")
-            st.dataframe(df.head())
-            st.info("💡 تم الكشف التلقائي عن أنواع الأعمدة (انتقل إلى القسم 2).")
+            try:
+                if uploaded_file.name.endswith('.csv'):
+                    df = pd.read_csv(uploaded_file)
+                else:
+                    df = pd.read_excel(uploaded_file)
+                
+                st.session_state.df = df
+                cleaner = SmartCleaner(df)
+                st.session_state.col_types = cleaner.detect_column_types()
+                st.success(f"تم تحميل الملف بنجاح! ({df.shape[0]} صف و {df.shape[1]} عمود)")
+                st.dataframe(df.head())
+                st.info("💡 تم الكشف التلقائي عن أنواع الأعمدة (انتقل إلى القسم 2).")
+            except Exception as e:
+                st.error(f"حدث خطأ أثناء تحميل الملف: {e}")
 
-    # ... (نهاية الكود السابق)
-
-    # التحقق من وجود بيانات قبل الانتقال للأقسام الأخرى
+    # =========================================================
+    # نقطة التحكم الرئيسية: التحقق من وجود بيانات
+    # =========================================================
     if st.session_state.df is None:
-        st.info("👈 يرجى البدء بتحميل ملف البيانات أولاً.")
-        return  # يجب أن يكون return هو آخر شيء هنا
-        
+        if section != "1. تحميل البيانات":
+            st.info("👈 يرجى البدء بتحميل ملف البيانات أولاً.")
+        return
+
+    # تعريف المتغيرات بعد التأكد من وجود البيانات
     df = st.session_state.df
     cleaner = SmartCleaner(df)
     col_types = st.session_state.col_types
 
-    # --- 2. فحص البيانات (5 عمليات) ---
-    # السطر 228 يجب أن يكون متطابقًا في المسافة البادئة مع "elif section == "1. تحميل البيانات":"
+    # =========================================================
+    # 2. فحص البيانات
+    # =========================================================
     elif section == "2. فحص البيانات":
         st.header("🔍 2. فحص البيانات الشامل (5 عمليات)")
         st.subheader("تحليل سريع")
@@ -242,7 +254,9 @@ def main():
         st.subheader("إحصائيات وصفية")
         st.dataframe(df.describe(include='all'))
 
-    # --- 3. معالجة القيم المفقودة (10 عمليات) ---
+    # =========================================================
+    # 3. معالجة القيم المفقودة
+    # =========================================================
     elif section == "3. معالجة القيم المفقودة":
         st.header("🧩 3. معالجة القيم المفقودة (10 عمليات)")
         cols_with_nan = df.columns[df.isna().any()].tolist()
@@ -259,7 +273,9 @@ def main():
                 st.success(f"تمت المعالجة باستخدام: {method}")
                 st.dataframe(st.session_state.df.head())
 
-    # --- 4. معالجة القيم المتكررة (7 عمليات) ---
+    # =========================================================
+    # 4. معالجة القيم المتكررة
+    # =========================================================
     elif section == "4. معالجة القيم المتكررة":
         st.header("👯 4. معالجة القيم المتكررة (7 عمليات)")
         st.metric("عدد التكرارات التامة", df.duplicated().sum())
@@ -273,39 +289,41 @@ def main():
                 st.success(f"تم حذف {deleted_count} صف مكرر.")
             elif method == "Fuzzy Match (Text)" and cols:
                 st.info("عملية المطابقة الضبابية قد تستغرق وقتاً طويلاً للبيانات الكبيرة.")
-                # هذه العملية توضح 5 عمليات ضمنية (مثل: QRatio, Jaro-Winkler)
-                st.session_state.df, _ = cleaner.handle_duplicates(cols, method, threshold=90)
-                st.success("تم محاولة دمج السجلات المتشابهة.")
+                st.session_state.df, deleted_count = cleaner.handle_duplicates(cols, method, threshold=90)
+                st.success(f"تم محاولة دمج السجلات المتشابهة. تم إزالة {deleted_count} سجل.")
             st.dataframe(st.session_state.df.head())
 
-    # --- 5. معالجة القيم الشاذة (8 عمليات) ---
+    # =========================================================
+    # 5. معالجة القيم الشاذة
+    # =========================================================
     elif section == "5. معالجة القيم الشاذة":
         st.header("📈 5. معالجة القيم الشاذة (8 عمليات)")
-        numeric_cols = col_types['numeric']
+        numeric_cols = col_types.get('numeric', [])
         target_col = st.multiselect("اختر الأعمدة الرقمية للفحص", numeric_cols)
         
         methods = ["IQR Method", "Z-Score Filter", "Isolation Forest (AI)", 
-                   "Capping (Winsorization)", "Log Transformation"] # 5 عمليات
+                   "Capping (Winsorization)", "Log Transformation"]
         method = st.selectbox("طريقة المعالجة (تشمل حذف/استبدال)", methods)
         
         if st.button("تطبيق كشف الشواذ"):
             st.session_state.df, deleted_count = cleaner.handle_outliers(target_col, method)
             st.success(f"تم تطبيق {method}. تم حذف/تعديل {deleted_count} صف.")
             st.dataframe(st.session_state.df.head())
-        
         # 
 
 [Image of outliers detection boxplot]
 
 
-    # --- 6. معالجة الأخطاء الإملائية واللغوية (15 عملية) ---
+    # =========================================================
+    # 6. معالجة الأخطاء الإملائية واللغوية
+    # =========================================================
     elif section == "6. معالجة الأخطاء الإملائية واللغوية":
         st.header("✍️ 6. معالجة الأخطاء الإملائية واللغوية (15 عملية)")
-        text_cols = col_types['text']
+        text_cols = col_types.get('text', [])
         target_text_col = st.multiselect("اختر الأعمدة النصية", text_cols)
         
         nlp_operations = ["Lowercase", "Uppercase", "Remove Punctuation", 
-                          "Remove Stop Words (English)", "Spelling Correction (English Only)"] # 5 عمليات
+                          "Remove Stop Words (English)", "Spelling Correction (English Only)"]
         selected_ops = st.multiselect("اختر عمليات التنظيف الأولي (5 عمليات)", nlp_operations)
 
         if st.button("تطبيق عمليات التنظيف"):
@@ -314,7 +332,9 @@ def main():
             st.success("تم تطبيق العمليات المحددة.")
             st.dataframe(st.session_state.df[target_text_col].head())
 
-    # --- 7. تنسيق الأعمدة وأنواعها (8 عمليات) ---
+    # =========================================================
+    # 7. تنسيق الأعمدة وأنواعها
+    # =========================================================
     elif section == "7. تنسيق الأعمدة وأنواعها":
         st.header("📐 7. تنسيق الأعمدة (8 عمليات)")
         all_cols = df.columns.tolist()
@@ -332,7 +352,9 @@ def main():
             except Exception as e:
                 st.error(f"فشل التغيير: {e}")
 
-    # --- 8. معالجة الأعمدة (إعادة تسمية/حذف) (4 عمليات) ---
+    # =========================================================
+    # 8. معالجة الأعمدة (إعادة تسمية/حذف)
+    # =========================================================
     elif section == "8. معالجة الأعمدة (إعادة تسمية/حذف)":
         st.header("🗑️ 8. إدارة الأعمدة (4 عمليات)")
         
@@ -351,10 +373,12 @@ def main():
             st.success("تم الحذف.")
             st.experimental_rerun()
 
-    # --- 9. معالجة النصوص والترجمة (التركيز على الترجمة) (5 عمليات) ---
+    # =========================================================
+    # 9. معالجة النصوص والترجمة
+    # =========================================================
     elif section == "9. معالجة النصوص والترجمة":
         st.header("🌐 9. معالجة النصوص والترجمة")
-        text_cols = col_types['text']
+        text_cols = col_types.get('text', [])
         target_text_col = st.selectbox("اختر عمود النص للترجمة", text_cols)
         
         translate_method = st.selectbox("اختر عملية الترجمة", 
@@ -373,14 +397,16 @@ def main():
             st.success("تمت الترجمة بنجاح.")
             st.dataframe(st.session_state.df[[target_text_col]].head())
 
-    # --- 10. معالجة القيم غير المنطقية (10 عمليات) ---
+    # =========================================================
+    # 10. معالجة القيم غير المنطقية
+    # =========================================================
     elif section == "10. معالجة القيم غير المنطقية":
         st.header("🧠 10. معالجة القيم غير المنطقية (10 عمليات)")
-        numeric_cols = col_types['numeric']
+        numeric_cols = col_types.get('numeric', [])
         target_logic = st.selectbox("اختر عموداً رقمياً للفحص المنطقي", numeric_cols)
         
         logic_ops = ["Replace Negatives with 0", "Absolute Value (Turn Negative to Positive)", 
-                     "Check for Age > 120", "Replace Zeros with NaN (for division)"] # 4 عمليات
+                     "Check for Age > 120", "Replace Zeros with NaN (for division)"]
         logic_action = st.selectbox("الإجراء المنطقي", logic_ops)
         
         if st.button("تطبيق المنطق"):
@@ -393,14 +419,16 @@ def main():
             st.success(f"تم تطبيق المنطق: {logic_action}")
             st.dataframe(st.session_state.df.head())
 
-    # --- 11. معالجة البيانات الزمنية (10 عمليات) ---
+    # =========================================================
+    # 11. معالجة البيانات الزمنية
+    # =========================================================
     elif section == "11. معالجة البيانات الزمنية":
         st.header("📅 11. معالجة البيانات الزمنية (10 عمليات)")
         all_cols = df.columns.tolist()
         date_col = st.selectbox("اختر العمود الذي يحتوي على تواريخ", all_cols)
         
         time_ops = ["Extract Year", "Extract Month", "Extract Day", "Extract Hour", 
-                    "Timezone Localization (UTC)"] # 5 عمليات
+                    "Timezone Localization (UTC)"]
         selected_ops = st.multiselect("اختر عمليات استخراج وتنسيق الوقت", time_ops)
         
         if st.button("تطبيق عمليات الوقت"):
@@ -408,7 +436,9 @@ def main():
             st.success("تم تطبيق عمليات الوقت.")
             st.dataframe(st.session_state.df.head())
 
-    # --- 12. حفظ وتحميل البيانات ---
+    # =========================================================
+    # 12. حفظ وتحميل البيانات
+    # =========================================================
     elif section == "12. حفظ وتحميل البيانات":
         st.header("💾 12. حفظ وتحميل البيانات")
         
