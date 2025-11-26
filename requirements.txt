@@ -1,11 +1,5 @@
 streamlit
 pandas
 numpy
-scikit-learn
-textblob
-langdetect
-deep-translator  # المكتبة الجديدة اللازمة للترجمة
-fuzzywuzzy
-python-Levenshtein
-openpyxl
-nltk
+deep-translator
+plotly
