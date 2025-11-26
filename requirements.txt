@@ -1,0 +1,11 @@
+streamlit
+pandas
+numpy
+scikit-learn
+textblob
+langdetect
+fuzzywuzzy
+python-Levenshtein
+openpyxl
+# لإصلاح بعض مشكلات الترميز والتعامل مع النصوص
+nltk
