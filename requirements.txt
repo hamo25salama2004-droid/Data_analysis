@@ -3,3 +3,4 @@ pandas
 numpy
 deep-translator
 plotly
+openpyxl  # <--- تمت إضافة هذا السطر
