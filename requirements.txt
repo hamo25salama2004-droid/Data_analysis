@@ -4,8 +4,8 @@ numpy
 scikit-learn
 textblob
 langdetect
+deep-translator  # المكتبة الجديدة اللازمة للترجمة
 fuzzywuzzy
 python-Levenshtein
 openpyxl
-# لإصلاح بعض مشكلات الترميز والتعامل مع النصوص
 nltk
