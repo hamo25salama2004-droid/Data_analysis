@@ -219,7 +219,7 @@ def main():
     if st.session_state.df is None:
         st.info("👈 يرجى البدء بتحميل ملف البيانات أولاً.")
         return
-        :
+        
     df = st.session_state.df
     cleaner = SmartCleaner(df)
     col_types = st.session_state.col_types
