@@ -1,469 +1,419 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from sklearn.impute import KNNImputer, IterativeImputer # للتعويض الذكي (MICE)
-from sklearn.ensemble import IsolationForest # لكشف الشواذ (AI)
-from textblob import TextBlob
-from langdetect import detect, LangDetectException
-from deep_translator import GoogleTranslator # للترجمة
-from fuzzywuzzy import fuzz # للمطابقة الضبابية
 import re
-import io
+from io import BytesIO
+from deep_translator import GoogleTranslator
+import plotly.express as px # تم إضافة الاستيراد هنا لضمان عمل قسم تحليل الربحية
 
-# -----------------------------------------------------------------------------
-# Class: SmartCleaner (الفئة الذكية لتنفيذ جميع العمليات)
-# -----------------------------------------------------------------------------
-class SmartCleaner:
-    def __init__(self, df):
-        self.df = df.copy()
+# ==========================================
+# إعداد الصفحة
+# ==========================================
+st.set_page_config(page_title="أداة تنظيف البيانات المتكاملة", layout="wide", page_icon="📊")
 
-    # --- 1. اكتشاف أنواع الأعمدة تلقائياً ---
-    def detect_column_types(self):
-        col_types = {"numeric": [], "text": [], "date": [], "categorical": []}
-        for col in self.df.columns:
-            if pd.api.types.is_datetime64_any_dtype(self.df[col]):
-                col_types["date"].append(col)
-            elif pd.api.types.is_numeric_dtype(self.df[col]):
-                col_types["numeric"].append(col)
-            else:
-                if self.df[col].nunique() < 50 and self.df.shape[0] > 100:
-                    col_types["categorical"].append(col)
-                col_types["text"].append(col)
-        return col_types
+# ------------------------------------------------------------------
+# إدارة حالة الجلسة (Session State)
+# ------------------------------------------------------------------
+if 'df' not in st.session_state:
+    st.session_state.df = None
 
-    # --- 2. معالجة القيم المفقودة (10 عمليات) ---
-    def handle_missing(self, cols, method):
-        if method == "Drop Rows":
-            self.df = self.df.dropna(subset=cols)
-        elif method == "Drop Column":
-            self.df = self.df.drop(columns=cols, errors='ignore')
-        elif method == "KNN Imputer (AI)":
-            imputer = KNNImputer(n_neighbors=5)
-            self.df[cols] = imputer.fit_transform(self.df[cols])
-        elif method == "MICE Imputer (AI)":
-            imputer = IterativeImputer(random_state=42)
-            self.df[cols] = imputer.fit_transform(self.df[cols])
-        elif method == "Mean Fill":
-            self.df[cols] = self.df[cols].fillna(self.df[cols].mean())
-        elif method == "Median Fill":
-            self.df[cols] = self.df[cols].fillna(self.df[cols].median())
-        elif method == "Mode Fill":
-            for col in cols:
-                self.df[col] = self.df[col].fillna(self.df[col].mode()[0])
-        elif method == "Constant Fill (Zero)":
-            self.df[cols] = self.df[cols].fillna(0)
-        elif method == "Forward Fill (ffill)":
-            self.df[cols] = self.df[cols].ffill()
-        elif method == "Backward Fill (bfill)":
-            self.df[cols] = self.df[cols].bfill()
-        return self.df
+# ------------------------------------------------------------------
+# دوال مساعدة
+# ------------------------------------------------------------------
+def convert_df(df, file_type):
+    """تحويل الداتا فريم إلى ملف بايت للتحميل"""
+    buffer = BytesIO()
+    if file_type == 'csv':
+        # استخدام utf-8-sig لدعم اللغة العربية في ملفات CSV المحملة على ويندوز/إكسل
+        df.to_csv(buffer, index=False, encoding='utf-8-sig')
+    else:
+        df.to_excel(buffer, index=False)
+    buffer.seek(0)
+    return buffer
 
-    # --- 3. معالجة القيم المتكررة (7 عمليات) ---
-    def handle_duplicates(self, cols, method, threshold=95):
-        if method == "Exact Duplicates":
-            initial_rows = self.df.shape[0]
-            self.df = self.df.drop_duplicates(subset=cols, keep='first')
-            return self.df, initial_rows - self.df.shape[0]
-        
-        elif method == "Fuzzy Match (Text)":
-            # تبسيط منطق Fuzzy Match للحفاظ على سرعة Streamlit
-            def get_fuzz_score(row):
-                combined = tuple(row[c] for c in cols)
-                scores = []
-                # نقارن مع عينة فقط لتسريع العملية
-                sample_df = self.df.sample(min(100, len(self.df))) 
-                for i in range(len(sample_df)):
-                    target_combined = tuple(sample_df.iloc[i][c] for c in cols)
-                    if row.name != sample_df.iloc[i].name:
-                        score = fuzz.QRatio(str(combined), str(target_combined))
-                        scores.append(score)
-                return max(scores) if scores else 100
+# ------------------------------------------------------------------
+# القائمة الجانبية (Sidebar)
+# ------------------------------------------------------------------
+st.sidebar.title("لوحة التحكم")
+st.sidebar.markdown("---")
 
-            # نحدد ونحذف الصفوف التي لديها تطابق قوي جداً
-            duplicate_indices = self.df.apply(lambda row: get_fuzz_score(row) >= threshold, axis=1)
-            initial_rows = self.df.shape[0]
-            self.df = self.df[~duplicate_indices].drop_duplicates(subset=cols, keep='first') # نحذف الصفوف المشابهة
+options = [
+    "تحميل البيانات",
+    "فحص البيانات",
+    "معالجة القيم المفقودة",
+    "معالجة القيم المتكررة",
+    "معالجة القيم الشاذة",
+    "معالجة الأخطاء الإملائية",
+    "تنسيق الأعمدة",
+    "معالجة الأعمدة (إعادة تسمية/حذف)",
+    "معالجة النصوص والترجمة",
+    "معالجة القيم غير المنطقية",
+    "معالجة البيانات الزمنية",
+    "تحليل الربحية", # تم التأكد من إضافة الخيار هنا
+    "حفظ وتحميل البيانات"
+]
 
-            return self.df, initial_rows - self.df.shape[0]
-        
-        return self.df, 0
+choice = st.sidebar.radio("اختر القسم:", options)
 
-    # --- 4. معالجة القيم الشاذة (8 عمليات) ---
-    def handle_outliers(self, cols, method, threshold=3):
-        initial_rows = self.df.shape[0]
-        for col in cols:
-            if method == "IQR Method":
-                Q1 = self.df[col].quantile(0.25)
-                Q3 = self.df[col].quantile(0.75)
-                IQR = Q3 - Q1
-                lower_bound = Q1 - 1.5 * IQR
-                upper_bound = Q3 + 1.5 * IQR
-                self.df = self.df[(self.df[col] >= lower_bound) & (self.df[col] <= upper_bound)]
-            
-            elif method == "Z-Score Filter":
-                self.df = self.df[np.abs(self.df[col]-self.df[col].mean())/self.df[col].std() < threshold]
+st.title("🛠️ أداة تنظيف وتحليل البيانات الشاملة")
 
-            elif method == "Isolation Forest (AI)":
-                iso = IsolationForest(contamination=0.1, random_state=42)
-                # يجب تعبئة القيم المفقودة قبل تطبيق Isolation Forest
-                temp_data = self.df[col].fillna(self.df[col].median()).values.reshape(-1, 1)
-                yhat = iso.fit_predict(temp_data)
-                mask = yhat != -1
-                self.df = self.df[mask]
-
-            elif method == "Capping (Winsorization)":
-                Q1 = self.df[col].quantile(0.05)
-                Q3 = self.df[col].quantile(0.95)
-                self.df[col] = np.where(self.df[col] < Q1, Q1, self.df[col])
-                self.df[col] = np.where(self.df[col] > Q3, Q3, self.df[col])
-            
-            elif method == "Log Transformation":
-                self.df[col] = np.log1p(self.df[col]) 
-
-        return self.df, initial_rows - self.df.shape[0]
-
-    # --- 5. معالجة النصوص والترجمة (15 عملية + ترجمة) ---
-    def handle_text_and_translate(self, cols, method, target_lang=None):
-        for col in cols:
-            # يجب التأكد أن العمود نصي قبل محاولة المعالجة
-            self.df[col] = self.df[col].astype(str).replace('nan', '')
-            
-            if method == "Lowercase":
-                self.df[col] = self.df[col].str.lower()
-            elif method == "Uppercase":
-                self.df[col] = self.df[col].str.upper()
-            elif method == "Remove Punctuation":
-                self.df[col] = self.df[col].str.replace(r'[^\w\s]', '', regex=True)
-            elif method == "Remove Stop Words (English)":
-                # يتطلب تحميل مكتبة nltk
+# ------------------------------------------------------------------
+# 1. تحميل البيانات
+# ------------------------------------------------------------------
+if choice == "تحميل البيانات":
+    st.header("📂 تحميل ملف البيانات")
+    uploaded_file = st.file_uploader("اختر ملف (CSV أو Excel)", type=['csv', 'xlsx', 'xls'])
+    
+    if uploaded_file is not None:
+        try:
+            if uploaded_file.name.endswith('.csv'):
+                # محاولة القراءة بإعدادات مختلفة إذا فشلت الأولى
                 try:
-                    import nltk
-                    from nltk.corpus import stopwords
-                    nltk.download('stopwords', quiet=True)
-                    stop_words = set(stopwords.words('english'))
-                    self.df[col] = self.df[col].apply(lambda x: ' '.join([word for word in x.split() if word not in stop_words]))
-                except Exception as e:
-                    st.warning(f"لإزالة Stop Words، يرجى التأكد من تثبيت nltk: {e}")
-
-            elif method == "Spelling Correction (English Only)":
-                # هذه العملية هي أحد أجزاء الـ 100 عملية
-                self.df[col] = self.df[col].apply(lambda x: str(TextBlob(x).correct()))
-
-            # --- الترجمة (المطلوب في الكود) ---
-            elif method in ["Translate to English", "Translate to Arabic"]:
-                if target_lang:
-                    # نستخدم GoogleTranslator من deep_translator
-                    translator = GoogleTranslator(source='auto', target=target_lang)
-                    # الترجمة تتم صفاً بصف
-                    self.df[col] = self.df[col].apply(lambda x: translator.translate(x) if x and x != 'nan' else x)
-        return self.df
-
-    # --- 6. معالجة البيانات الزمنية (10 عمليات) ---
-    def handle_time(self, col, operations):
-        # 1. تحويل للـ Datetime
-        self.df[col] = pd.to_datetime(self.df[col], errors='coerce')
-        
-        for op in operations:
-            if op == "Extract Year":
-                self.df[f'{col}_Year'] = self.df[col].dt.year
-            elif op == "Extract Month":
-                self.df[f'{col}_Month'] = self.df[col].dt.month
-            elif op == "Extract Day":
-                self.df[f'{col}_Day'] = self.df[col].dt.day
-            elif op == "Extract Hour":
-                self.df[f'{col}_Hour'] = self.df[col].dt.hour
-            elif op == "Timezone Localization (UTC)":
-                self.df[col] = self.df[col].dt.tz_localize(None).dt.tz_localize('UTC')
-        return self.df
-
-# -----------------------------------------------------------------------------
-# Streamlit UI - واجهة المستخدم (12 قسم)
-# -----------------------------------------------------------------------------
-
-def main():
-    st.set_page_config(page_title="AI Data Cleaner Pro V2", layout="wide", page_icon="🤖")
-    
-    st.title("🤖 AI Data Cleaner Pro - محرك الـ 100 عملية (الإصدار النهائي)")
-    st.markdown("---")
-
-    # --- Session State ---
-    if 'df' not in st.session_state:
-        st.session_state.df = None
-        st.session_state.col_types = None
-    
-    # --- Sidebar Menu (12 قسم) ---
-    st.sidebar.title("إدارة عمليات التنظيف")
-    sections = [
-        "1. تحميل البيانات", "2. فحص البيانات", "3. معالجة القيم المفقودة",
-        "4. معالجة القيم المتكررة", "5. معالجة القيم الشاذة", "6. معالجة الأخطاء الإملائية واللغوية",
-        "7. تنسيق الأعمدة وأنواعها", "8. معالجة الأعمدة (إعادة تسمية/حذف)",
-        "9. معالجة النصوص والترجمة", "10. معالجة القيم غير المنطقية",
-        "11. معالجة البيانات الزمنية", "12. حفظ وتحميل البيانات"
-    ]
-    section = st.sidebar.radio("اختر القسم:", sections)
-    
-    # =========================================================
-    # 1. تحميل البيانات
-    # =========================================================
-    if section == "1. تحميل البيانات":
-        st.header("📂 1. تحميل البيانات")
-        uploaded_file = st.file_uploader("ارفع ملف CSV أو Excel", type=["csv", "xlsx"])
-        if uploaded_file:
-            try:
-                if uploaded_file.name.endswith('.csv'):
-                    df = pd.read_csv(uploaded_file)
-                else:
-                    df = pd.read_excel(uploaded_file)
+                    df = pd.read_csv(uploaded_file, encoding='utf-8-sig')
+                except UnicodeDecodeError:
+                    uploaded_file.seek(0)
+                    df = pd.read_csv(uploaded_file, encoding='latin1')
+            else:
+                df = pd.read_excel(uploaded_file)
                 
-                st.session_state.df = df
-                cleaner = SmartCleaner(df)
-                st.session_state.col_types = cleaner.detect_column_types()
-                st.success(f"تم تحميل الملف بنجاح! ({df.shape[0]} صف و {df.shape[1]} عمود)")
-                st.dataframe(df.head())
-                st.info("💡 تم الكشف التلقائي عن أنواع الأعمدة (انتقل إلى القسم 2).")
-            except Exception as e:
-                st.error(f"حدث خطأ أثناء تحميل الملف: {e}")
+            st.session_state.df = df
+            st.success(f"تم تحميل الملف '{uploaded_file.name}' بنجاح!")
+            st.dataframe(df.head())
+        except Exception as e:
+            st.error(f"حدث خطأ أثناء التحميل: {e}")
 
-    # =========================================================
-    # نقطة التحكم الرئيسية: التحقق من وجود بيانات
-    # =========================================================
-    if st.session_state.df is None:
-        if section != "1. تحميل البيانات":
-            st.info("👈 يرجى البدء بتحميل ملف البيانات أولاً.")
-        return
+# التحقق من وجود بيانات
+if st.session_state.df is not None:
+    df = st.session_state.df # اختصار
 
-    # تعريف المتغيرات بعد التأكد من وجود البيانات
-    df = st.session_state.df
-    cleaner = SmartCleaner(df)
-    col_types = st.session_state.col_types
-
-    # =========================================================
+    # ------------------------------------------------------------------
     # 2. فحص البيانات
-    # =========================================================
-    elif section == "2. فحص البيانات":
-        st.header("🔍 2. فحص البيانات الشامل (5 عمليات)")
-        st.subheader("تحليل سريع")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("عدد الصفوف", df.shape[0])
-        c2.metric("القيم المفقودة", df.isna().sum().sum())
-        c3.metric("الصفوف المكررة", df.duplicated().sum())
+    # ------------------------------------------------------------------
+    if choice == "فحص البيانات":
+        st.header("🔍 فحص البيانات")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.info(f"عدد الصفوف: {df.shape[0]}")
+        with col2:
+            st.info(f"عدد الأعمدة: {df.shape[1]}")
 
-        st.subheader("ملخص الأعمدة وأنواعها")
-        st.json(col_types)
+        st.subheader("أنواع البيانات")
+        st.write(df.dtypes.astype(str))
         
         st.subheader("إحصائيات وصفية")
-        st.dataframe(df.describe(include='all'))
+        st.write(df.describe(include='all'))
 
-    # =========================================================
+    # ------------------------------------------------------------------
     # 3. معالجة القيم المفقودة
-    # =========================================================
-    elif section == "3. معالجة القيم المفقودة":
-        st.header("🧩 3. معالجة القيم المفقودة (10 عمليات)")
-        cols_with_nan = df.columns[df.isna().any()].tolist()
-        if not cols_with_nan: st.success("لا توجد قيم مفقودة!")
-        else:
-            col_to_impute = st.multiselect("1. اختر الأعمدة للمعالجة", cols_with_nan)
-            method = st.selectbox("2. اختر طريقة التعويض", 
-                                  ["Drop Rows", "Drop Column", "Mean Fill", "Median Fill", 
-                                   "Mode Fill", "Constant Fill (Zero)", "Forward Fill (ffill)", 
-                                   "Backward Fill (bfill)", "KNN Imputer (AI)", "MICE Imputer (AI)"])
+    # ------------------------------------------------------------------
+    elif choice == "معالجة القيم المفقودة":
+        st.header("🧩 معالجة القيم المفقودة")
+        missing_data = df.isnull().sum()
+        if missing_data.sum() > 0:
+            st.warning("يوجد قيم مفقودة:")
+            st.write(missing_data[missing_data > 0])
             
-            if st.button("تطبيق المعالجة"):
-                st.session_state.df = cleaner.handle_missing(col_to_impute, method)
-                st.success(f"تمت المعالجة باستخدام: {method}")
-                st.dataframe(st.session_state.df.head())
+            action = st.selectbox("اختر إجراء:", ["حذف الصفوف", "حذف الأعمدة", "تعويض القيم"])
+            
+            if action == "حذف الصفوف":
+                if st.button("تطبيق"):
+                    st.session_state.df = df.dropna(axis=0)
+                    st.success("تم الحذف.")
+                    st.rerun()
+            elif action == "حذف الأعمدة":
+                if st.button("تطبيق"):
+                    st.session_state.df = df.dropna(axis=1)
+                    st.success("تم الحذف.")
+                    st.rerun()
+            elif action == "تعويض القيم":
+                col_to_fill = st.selectbox("العمود:", df.columns)
+                method = st.radio("الطريقة:", ["المتوسط", "الوسيط", "الوضع", "قيمة ثابتة"])
+                val_to_fill = st.text_input("القيمة الثابتة:") if method == "قيمة ثابتة" else None
 
-    # =========================================================
+                if st.button("تطبيق"):
+                    try:
+                        if method == "المتوسط": st.session_state.df[col_to_fill] = df[col_to_fill].fillna(df[col_to_fill].mean())
+                        elif method == "الوسيط": st.session_state.df[col_to_fill] = df[col_to_fill].fillna(df[col_to_fill].median())
+                        elif method == "الوضع": st.session_state.df[col_to_fill] = df[col_to_fill].fillna(df[col_to_fill].mode()[0])
+                        elif method == "قيمة ثابتة": st.session_state.df[col_to_fill] = df[col_to_fill].fillna(val_to_fill)
+                        st.success("تم التعويض.")
+                        st.rerun()
+                    except Exception as e: st.error(f"خطأ: {e}")
+        else:
+            st.success("لا توجد قيم مفقودة.")
+
+    # ------------------------------------------------------------------
     # 4. معالجة القيم المتكررة
-    # =========================================================
-    elif section == "4. معالجة القيم المتكررة":
-        st.header("👯 4. معالجة القيم المتكررة (7 عمليات)")
-        st.metric("عدد التكرارات التامة", df.duplicated().sum())
-        
-        cols = st.multiselect("اختر الأعمدة للفحص والدمج (للتكرار الجزئي)", df.columns)
-        method = st.selectbox("طريقة المعالجة", ["Exact Duplicates", "Fuzzy Match (Text)"])
-        
-        if st.button("تطبيق الحذف/الدمج"):
-            if method == "Exact Duplicates":
-                st.session_state.df, deleted_count = cleaner.handle_duplicates(df.columns, method)
-                st.success(f"تم حذف {deleted_count} صف مكرر.")
-            elif method == "Fuzzy Match (Text)" and cols:
-                st.info("عملية المطابقة الضبابية قد تستغرق وقتاً طويلاً للبيانات الكبيرة.")
-                st.session_state.df, deleted_count = cleaner.handle_duplicates(cols, method, threshold=90)
-                st.success(f"تم محاولة دمج السجلات المتشابهة. تم إزالة {deleted_count} سجل.")
-            st.dataframe(st.session_state.df.head())
-
-    # =========================================================
-    # 5. معالجة القيم الشاذة
-    # =========================================================
-    elif section == "5. معالجة القيم الشاذة":
-        st.header("📈 5. معالجة القيم الشاذة (8 عمليات)")
-        numeric_cols = col_types.get('numeric', [])
-        target_col = st.multiselect("اختر الأعمدة الرقمية للفحص", numeric_cols)
-        
-        methods = ["IQR Method", "Z-Score Filter", "Isolation Forest (AI)", 
-                   "Capping (Winsorization)", "Log Transformation"]
-        method = st.selectbox("طريقة المعالجة (تشمل حذف/استبدال)", methods)
-        
-        if st.button("تطبيق كشف الشواذ"):
-            st.session_state.df, deleted_count = cleaner.handle_outliers(target_col, method)
-            st.success(f"تم تطبيق {method}. تم حذف/تعديل {deleted_count} صف.")
-            st.dataframe(st.session_state.df.head())
-        # 
-
-[Image of outliers detection boxplot]
-
-
-    # =========================================================
-    # 6. معالجة الأخطاء الإملائية واللغوية
-    # =========================================================
-    elif section == "6. معالجة الأخطاء الإملائية واللغوية":
-        st.header("✍️ 6. معالجة الأخطاء الإملائية واللغوية (15 عملية)")
-        text_cols = col_types.get('text', [])
-        target_text_col = st.multiselect("اختر الأعمدة النصية", text_cols)
-        
-        nlp_operations = ["Lowercase", "Uppercase", "Remove Punctuation", 
-                          "Remove Stop Words (English)", "Spelling Correction (English Only)"]
-        selected_ops = st.multiselect("اختر عمليات التنظيف الأولي (5 عمليات)", nlp_operations)
-
-        if st.button("تطبيق عمليات التنظيف"):
-            for op in selected_ops:
-                st.session_state.df = cleaner.handle_text_and_translate(target_text_col, op)
-            st.success("تم تطبيق العمليات المحددة.")
-            st.dataframe(st.session_state.df[target_text_col].head())
-
-    # =========================================================
-    # 7. تنسيق الأعمدة وأنواعها
-    # =========================================================
-    elif section == "7. تنسيق الأعمدة وأنواعها":
-        st.header("📐 7. تنسيق الأعمدة (8 عمليات)")
-        all_cols = df.columns.tolist()
-        col_to_format = st.selectbox("اختر العمود للتنسيق", all_cols)
-        
-        st.subheader("تغيير النوع (Casting)")
-        new_type = st.selectbox("النوع الجديد", ['str', 'int', 'float', 'datetime'])
-        if st.button("تغيير نوع العمود"):
-            try:
-                if new_type == 'datetime':
-                    st.session_state.df[col_to_format] = pd.to_datetime(st.session_state.df[col_to_format], errors='coerce')
-                else:
-                    st.session_state.df[col_to_format] = st.session_state.df[col_to_format].astype(new_type)
-                st.success(f"تم تغيير نوع {col_to_format} إلى {new_type}")
-            except Exception as e:
-                st.error(f"فشل التغيير: {e}")
-
-    # =========================================================
-    # 8. معالجة الأعمدة (إعادة تسمية/حذف)
-    # =========================================================
-    elif section == "8. معالجة الأعمدة (إعادة تسمية/حذف)":
-        st.header("🗑️ 8. إدارة الأعمدة (4 عمليات)")
-        
-        st.subheader("إعادة التسمية")
-        col_to_rename = st.selectbox("اختر عمود لإعادة تسميته", df.columns)
-        new_name = st.text_input("الاسم الجديد", key="rename_input")
-        if st.button("تغيير الاسم"):
-            st.session_state.df = df.rename(columns={col_to_rename: new_name})
-            st.success("تم التغيير بنجاح.")
-            st.experimental_rerun()
-        
-        st.subheader("حذف أعمدة")
-        cols_to_drop = st.multiselect("اختر أعمدة لحذفها", df.columns)
-        if st.button("حذف الأعمدة المحددة"):
-            st.session_state.df = df.drop(columns=cols_to_drop)
+    # ------------------------------------------------------------------
+    elif choice == "معالجة القيم المتكررة":
+        st.header("👯 معالجة القيم المتكررة")
+        duplicates = df.duplicated().sum()
+        st.write(f"صفوف مكررة بالكامل: {duplicates}")
+        if duplicates > 0 and st.button("حذف الكل"):
+            st.session_state.df = df.drop_duplicates()
             st.success("تم الحذف.")
-            st.experimental_rerun()
+            st.rerun()
 
-    # =========================================================
-    # 9. معالجة النصوص والترجمة
-    # =========================================================
-    elif section == "9. معالجة النصوص والترجمة":
-        st.header("🌐 9. معالجة النصوص والترجمة")
-        text_cols = col_types.get('text', [])
-        target_text_col = st.selectbox("اختر عمود النص للترجمة", text_cols)
-        
-        translate_method = st.selectbox("اختر عملية الترجمة", 
-                                        ["Translate to English", "Translate to Arabic"])
+        st.divider()
+        subset_cols = st.multiselect("حذف تكرار بناءً على أعمدة معينة:", df.columns)
+        if subset_cols and st.button("حذف المحدد"):
+            st.session_state.df = df.drop_duplicates(subset=subset_cols)
+            st.success("تم الحذف.")
+            st.rerun()
 
-        st.warning("⚠️ الترجمة تعتمد على API خارجي وقد تكون بطيئة أو غير مستقرة للبيانات الكبيرة.")
-        
-        if st.button(f"بدء الترجمة: {translate_method}"):
-            if translate_method == "Translate to English":
-                lang = 'en'
+    # ------------------------------------------------------------------
+    # 5. معالجة القيم الشاذة
+    # ------------------------------------------------------------------
+    elif choice == "معالجة القيم الشاذة":
+        st.header("📈 معالجة القيم الشاذة")
+        numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
+        if numeric_cols:
+            col = st.selectbox("العمود الرقمي:", numeric_cols)
+            method = st.radio("الطريقة:", ["IQR", "Z-Score"])
+            
+            if method == "IQR":
+                Q1, Q3 = df[col].quantile(0.25), df[col].quantile(0.75)
+                IQR = Q3 - Q1
+                lower, upper = Q1 - 1.5 * IQR, Q3 + 1.5 * IQR
             else:
-                lang = 'ar'
+                mean, std = df[col].mean(), df[col].std()
+                lower, upper = mean - 3 * std, mean + 3 * std
             
-            with st.spinner(f"جاري ترجمة العمود... قد يستغرق الأمر وقتاً."):
-                st.session_state.df = cleaner.handle_text_and_translate([target_text_col], translate_method, lang)
-            st.success("تمت الترجمة بنجاح.")
-            st.dataframe(st.session_state.df[[target_text_col]].head())
+            st.write(f"الحدود: {lower:.2f} - {upper:.2f}")
+            outliers = df[(df[col] < lower) | (df[col] > upper)].shape[0]
+            st.write(f"عدد القيم الشاذة: {outliers}")
+            
+            if outliers > 0:
+                act = st.selectbox("الإجراء:", ["حذف", "استبدال بالحدود"])
+                if st.button("تطبيق"):
+                    if act == "حذف": st.session_state.df = df[(df[col] >= lower) & (df[col] <= upper)]
+                    else: st.session_state.df[col] = np.clip(df[col], lower, upper)
+                    st.success("تم.")
+                    st.rerun()
+        else: st.warning("لا توجد أعمدة رقمية.")
 
-    # =========================================================
+    # ------------------------------------------------------------------
+    # 6. معالجة الأخطاء الإملائية (تم تعديل هذا القسم)
+    # ------------------------------------------------------------------
+    elif choice == "معالجة الأخطاء الإملائية":
+        st.header("📝 تنظيف النصوص")
+        text_cols = df.select_dtypes(include=['object', 'string']).columns
+        if len(text_cols) > 0:
+            col = st.selectbox("العمود:", text_cols)
+            op = st.selectbox("العملية:", ["إزالة مسافات", "أحرف صغيرة", "أحرف كبيرة", "إزالة رموز خاصة"])
+            
+            # --- التعديل هنا: إضافة حقل إدخال لتحديد الرمز المراد حذفه ---
+            regex_to_remove = None
+            if op == "إزالة رموز خاصة":
+                # القيمة الافتراضية هي ما كان عليه الكود الأصلي: حذف كل ما ليس حرفاً أو رقماً أو مسافة
+                symbol_to_remove = st.text_input(
+                    "الرمز أو الأنماط المراد حذفها (كـ تعبير عادي - Regex):", 
+                    value=r'[^\w\s]', 
+                    help="مثل: لإزالة علامات الترقيم فقط أدخل '[.,!?:;]'"
+                )
+                if symbol_to_remove:
+                    regex_to_remove = symbol_to_remove
+            # ----------------------------------------------------------
+
+            if st.button("تطبيق"):
+                st.session_state.df[col] = df[col].astype(str)
+                if op == "إزالة مسافات": 
+                    st.session_state.df[col] = df[col].str.strip()
+                elif op == "أحرف صغيرة": 
+                    st.session_state.df[col] = df[col].str.lower()
+                elif op == "أحرف كبيرة": 
+                    st.session_state.df[col] = df[col].str.upper()
+                elif op == "إزالة رموز خاصة":
+                    if regex_to_remove:
+                        st.session_state.df[col] = df[col].apply(lambda x: re.sub(regex_to_remove, '', str(x)))
+                    else:
+                        st.warning("الرجاء إدخال الرمز أو الأنماط المراد حذفها.")
+                        st.stop()
+                st.success("تم.")
+                st.rerun()
+        else: st.warning("لا توجد أعمدة نصية.")
+
+    # ------------------------------------------------------------------
+    # 7. تنسيق الأعمدة
+    # ------------------------------------------------------------------
+    elif choice == "تنسيق الأعمدة":
+        st.header("🔢 تنسيق الأعمدة")
+        col = st.selectbox("العمود:", df.columns)
+        to_type = st.selectbox("إلى:", ["رقمي", "تاريخ", "نص"])
+        if st.button("تحويل"):
+            try:
+                if to_type == "رقمي": st.session_state.df[col] = pd.to_numeric(df[col], errors='coerce')
+                elif to_type == "تاريخ": st.session_state.df[col] = pd.to_datetime(df[col], errors='coerce')
+                else: st.session_state.df[col] = df[col].astype(str)
+                st.success("تم التحويل.")
+                st.rerun()
+            except Exception as e: st.error(str(e))
+
+    # ------------------------------------------------------------------
+    # 8. معالجة الأعمدة
+    # ------------------------------------------------------------------
+    elif choice == "معالجة الأعمدة (إعادة تسمية/حذف)":
+        st.header("🛠️ إدارة الأعمدة")
+        tab1, tab2 = st.tabs(["إعادة تسمية", "حذف"])
+        with tab1:
+            old_name = st.selectbox("العمود القديم:", df.columns)
+            new_name = st.text_input("الاسم الجديد:")
+            if st.button("تغيير الاسم") and new_name:
+                st.session_state.df = df.rename(columns={old_name: new_name})
+                st.success("تم.")
+                st.rerun()
+        with tab2:
+            drop_cols = st.multiselect("حذف أعمدة:", df.columns)
+            if st.button("حذف") and drop_cols:
+                st.session_state.df = df.drop(columns=drop_cols)
+                st.success("تم.")
+                st.rerun()
+
+    # ------------------------------------------------------------------
+    # 9. معالجة النصوص والترجمة
+    # ------------------------------------------------------------------
+    elif choice == "معالجة النصوص والترجمة":
+        st.header("🔤 معالجة النصوص المتقدمة والترجمة")
+        text_cols = df.select_dtypes(include=['object', 'string']).columns
+        if len(text_cols) > 0:
+            col = st.selectbox("العمود النصي:", text_cols)
+            task = st.radio("المهمة:", ["إزالة الأرقام", "ترجمة (عربي <> إنجليزي)"])
+            
+            if task == "إزالة الأرقام":
+                if st.button("تطبيق"):
+                    st.session_state.df[col] = df[col].astype(str).apply(lambda x: re.sub(r'\d+', '', x))
+                    st.success("تم.")
+                    st.rerun()
+            
+            elif task == "ترجمة (عربي <> إنجليزي)":
+                st.markdown("### 🌍 الترجمة الفورية")
+                trans_dir = st.selectbox("الاتجاه:", ["من الإنجليزية إلى العربية", "من العربية إلى الإنجليزية"])
+                
+                if st.button("بدء الترجمة (قد يستغرق وقتاً)"):
+                    try:
+                        src = 'en' if "الإنجليزية إلى العربية" in trans_dir else 'ar'
+                        dest = 'ar' if "الإنجليزية إلى العربية" in trans_dir else 'en'
+                        translator = GoogleTranslator(source=src, target=dest)
+                        
+                        prog = st.progress(0)
+                        res_list = []
+                        total = len(df)
+                        
+                        for i, txt in enumerate(df[col].astype(str)):
+                            if txt and txt.strip() and txt.lower() != 'nan':
+                                try:
+                                    res_list.append(translator.translate(txt))
+                                except:
+                                    res_list.append(txt)
+                            else:
+                                res_list.append(txt)
+                            if i % 5 == 0: prog.progress((i+1)/total)
+                        
+                        prog.progress(1.0)
+                        st.session_state.df[col] = res_list
+                        st.success("تمت الترجمة!")
+                        st.rerun()
+                    except Exception as e: st.error(f"خطأ: {e}")
+        else: st.warning("لا توجد أعمدة نصية.")
+
+    # ------------------------------------------------------------------
     # 10. معالجة القيم غير المنطقية
-    # =========================================================
-    elif section == "10. معالجة القيم غير المنطقية":
-        st.header("🧠 10. معالجة القيم غير المنطقية (10 عمليات)")
-        numeric_cols = col_types.get('numeric', [])
-        target_logic = st.selectbox("اختر عموداً رقمياً للفحص المنطقي", numeric_cols)
-        
-        logic_ops = ["Replace Negatives with 0", "Absolute Value (Turn Negative to Positive)", 
-                     "Check for Age > 120", "Replace Zeros with NaN (for division)"]
-        logic_action = st.selectbox("الإجراء المنطقي", logic_ops)
-        
-        if st.button("تطبيق المنطق"):
-            if logic_action == "Replace Negatives with 0":
-                st.session_state.df[target_logic] = st.session_state.df[target_logic].apply(lambda x: 0 if x < 0 else x)
-            elif logic_action == "Absolute Value (Turn Negative to Positive)":
-                st.session_state.df[target_logic] = st.session_state.df[target_logic].abs()
-            elif logic_action == "Replace Zeros with NaN (for division)":
-                 st.session_state.df[target_logic] = st.session_state.df[target_logic].replace(0, np.nan)
-            st.success(f"تم تطبيق المنطق: {logic_action}")
-            st.dataframe(st.session_state.df.head())
+    # ------------------------------------------------------------------
+    elif choice == "معالجة القيم غير المنطقية":
+        st.header("🤔 استبدال القيم")
+        col = st.selectbox("العمود:", df.columns, key='ill_col')
+        v_old = st.text_input("القيمة القديمة:")
+        v_new = st.text_input("القيمة الجديدة (فراغ = NaN):")
+        if st.button("استبدال"):
+            val = v_new if v_new else np.nan
+            st.session_state.df[col] = df[col].replace(v_old, val) # قد يحتاج ضبط أنواع
+            st.success("تم.")
+            st.rerun()
 
-    # =========================================================
-    # 11. معالجة البيانات الزمنية
-    # =========================================================
-    elif section == "11. معالجة البيانات الزمنية":
-        st.header("📅 11. معالجة البيانات الزمنية (10 عمليات)")
-        all_cols = df.columns.tolist()
-        date_col = st.selectbox("اختر العمود الذي يحتوي على تواريخ", all_cols)
-        
-        time_ops = ["Extract Year", "Extract Month", "Extract Day", "Extract Hour", 
-                    "Timezone Localization (UTC)"]
-        selected_ops = st.multiselect("اختر عمليات استخراج وتنسيق الوقت", time_ops)
-        
-        if st.button("تطبيق عمليات الوقت"):
-            st.session_state.df = cleaner.handle_time(date_col, selected_ops)
-            st.success("تم تطبيق عمليات الوقت.")
-            st.dataframe(st.session_state.df.head())
+    # ------------------------------------------------------------------
+    # 11. البيانات الزمنية
+    # ------------------------------------------------------------------
+    elif choice == "معالجة البيانات الزمنية":
+        st.header("📅 السلاسل الزمنية")
+        d_col = st.selectbox("عمود التاريخ:", df.columns)
+        if st.button("تحويل لفهرس زمني"):
+            try:
+                st.session_state.df[d_col] = pd.to_datetime(df[d_col], errors='coerce')
+                st.session_state.df = st.session_state.df.dropna(subset=[d_col]).set_index(d_col).sort_index()
+                st.success("تم.")
+                st.rerun()
+            except: st.error("فشل التحويل.")
+        if isinstance(df.index, pd.DatetimeIndex) and st.button("إلغاء الفهرس الزمني"):
+            st.session_state.df = df.reset_index()
+            st.rerun()
 
-    # =========================================================
-    # 12. حفظ وتحميل البيانات
-    # =========================================================
-    elif section == "12. حفظ وتحميل البيانات":
-        st.header("💾 12. حفظ وتحميل البيانات")
+    # ------------------------------------------------------------------
+    # 12. تحليل الربحية
+    # ------------------------------------------------------------------
+    elif choice == "تحليل الربحية":
+        # تم نقل استيراد plotly.express إلى أعلى الكود لضمان توفره
+        st.header("💰 تحليل الربحية (Profit Analysis)")
         
-        file_format = st.radio("اختر صيغة الحفظ", ["CSV", "Excel"])
+        # التأكد من وجود أعمدة رقمية قابلة للحساب
+        numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
+
+        col_profit = st.selectbox("اختر عمود المبيعات/الإيرادات:", numeric_cols if numeric_cols else [None], key="profit_col")
         
-        if file_format == "CSV":
-            csv = df.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                label="📥 تحميل البيانات (CSV)",
-                data=csv,
-                file_name='clean_data.csv',
-                mime='text/csv',
-            )
-        else:
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                df.to_excel(writer, index=False, sheet_name='Sheet1')
-            processed_data = output.getvalue()
+        # إضافة خيار None للتكلفة لتمثيل حالة عدم وجود عمود تكلفة
+        cost_options = [None] + numeric_cols
+        col_cost = st.selectbox("اختر عمود التكلفة (اختياري):", cost_options, key="cost_col")
+        
+        col_product = st.selectbox("اختر عمود المنتج/الفئة للتجميع:", df.columns, key="prod_col")
+
+        # التأكد من أن المستخدم اختار الأعمدة المطلوبة قبل الحساب
+        if col_profit and col_product:
             
-            st.download_button(
-                label="📥 تحميل البيانات (Excel)",
-                data=processed_data,
-                file_name='clean_data.xlsx',
-                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            )
+            # محاولة تحويل الأعمدة إلى رقمية مرة أخرى لضمان عدم وجود مشاكل في Dtypes
+            try:
+                temp_df = df.copy()
+                temp_df[col_profit] = pd.to_numeric(temp_df[col_profit], errors='coerce')
+                
+                # حساب صافي الربح
+                if col_cost and col_cost != None:
+                    temp_df[col_cost] = pd.to_numeric(temp_df[col_cost], errors='coerce')
+                    temp_df['Net Profit'] = temp_df[col_profit] - temp_df[col_cost]
+                    profit_column_name = 'Net Profit'
+                    title_text = "صافي الربح لكل فئة/منتج"
+                else:
+                    profit_column_name = col_profit
+                    title_text = "إجمالي المبيعات/الإيرادات لكل فئة/منتج"
+                    
+                # التجميع والرسم
+                grouped_data = temp_df.groupby(col_product)[profit_column_name].sum().reset_index()
+                
+                profit_fig = px.bar(
+                    grouped_data, 
+                    x=col_product, 
+                    y=profit_column_name, 
+                    title=title_text,
+                    labels={col_product: col_product, profit_column_name: profit_column_name}
+                )
+                st.plotly_chart(profit_fig, use_container_width=True)
+                st.success("تم عرض التحليل بنجاح.")
+                
+            except Exception as e:
+                st.error(f"حدث خطأ في الحساب أو الرسم البياني. تأكد أن أعمدة المبيعات والتكلفة رقمية. التفاصيل: {e}")
+        else:
+            st.warning("الرجاء اختيار عمود المبيعات وعمود المنتج/الفئة على الأقل للتحليل.")
 
-if __name__ == "__main__":
-    main()
+
+    # ------------------------------------------------------------------
+    # 13. حفظ وتحميل
+    # ------------------------------------------------------------------
+    elif choice == "حفظ وتحميل البيانات":
+        st.header("💾 تحميل النتائج")
+        st.dataframe(df.head())
+        fn = st.text_input("اسم الملف:", "data_cleaned")
+        
+        c1, c2 = st.columns(2)
+        with c1:
+            st.download_button("تحميل CSV", convert_df(df, 'csv'), f"{fn}.csv", "text/csv")
+        with c2:
+            st.download_button("تحميل Excel", convert_df(df, 'excel'), f"{fn}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+else:
+    if choice != "تحميل البيانات": st.info("الرجاء تحميل ملف أولاً.")
